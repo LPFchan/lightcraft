@@ -270,9 +270,10 @@ fn linear_arw_gets_a_sensor_proxy_without_demosaicing() {
         metadata: lightcraft_meta::Metadata::default(),
         lens_metadata: Default::default(),
     };
+    // binned like a mosaic: a 124 MP Enhance DNG never develops at full size for its fit
     let proxy = sensor_proxy(&raw, 2, 384).unwrap();
-    assert_eq!((proxy.width, proxy.height), (32, 32));
-    assert_eq!(proxy.data[0], [0.2, 0.3, 0.4]);
+    assert_eq!((proxy.width, proxy.height), (16, 16));
+    assert!(proxy.data[0].iter().zip([0.2, 0.3, 0.4]).all(|(a, b)| (a - b).abs() < 1e-6), "{:?}", proxy.data[0]);
     raw.data = RawData::F32(Vec::new());
     assert!(sensor_proxy(&raw, 2, 384).is_none());
 }

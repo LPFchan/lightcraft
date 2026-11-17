@@ -21,8 +21,12 @@ use rayon::prelude::*;
 
 impl RawImage {
     /// Can `k × k` blocks be binned (single-plane CFA data, every `k × k` window containing R, G
-    /// and B; Bayer: `k` even, so that every block has the same layout)?
+    /// and B; Bayer: `k` even, so that every block has the same layout)? Linear (already demosaiced,
+    /// three samples per pixel) data bins at any `k`: each block is the mean of its pixels.
     pub fn can_bin(&self, k: usize) -> bool {
+        if self.cfa.is_none() && self.cpp == 3 {
+            return k >= 2 && (self.pixel_aspect - 1.0).abs() < 0.01;
+        }
         let Some(cfa) = &self.cfa else { return false };
         if k < 2 || self.cpp != 1 || (self.pixel_aspect - 1.0).abs() >= 0.01 || !cfa.valid() || (cfa.is_bayer() && !k.is_multiple_of(2)) {
             return false;
@@ -52,7 +56,6 @@ impl RawImage {
         if !self.can_bin(k) || !self.opcodes.list3.is_empty() {
             return Ok(None);
         }
-        let Some(cfa) = &self.cfa else { return Ok(None) };
         let a = self.active_area;
         // bin the default crop (relative to the active area) only
         let c = self.crop.clipped(a.width, a.height);
@@ -63,6 +66,7 @@ impl RawImage {
         }
         // Opcode lists 1/2 need the normalised copy; plain files are normalised row by row.
         let norm: Option<Normalized> = if self.opcodes.list1.is_empty() && self.opcodes.list2.is_empty() { None } else { Some(self.normalized()?) };
+        let Some(cfa) = &self.cfa else { return Ok(Some(self.bin_linear(k, clip, keep_max, c, norm.as_ref()))) };
         let cfa = cfa.shifted(a.x, a.y);
         let range = self.white_at(0) - self.black.mean();
         let scale = if range > 0.0 { 1.0 / range } else { 1.0 };
@@ -124,6 +128,48 @@ impl RawImage {
         });
         Ok(Some((out, mask)))
     }
+
+    /// [`Self::bin`] for linear data ([`Self::can_bin`]): every channel the mean of its block, normalised as
+    /// [`Self::normalized`] does, without the full-size float copy that an image of 100 MP or more cannot afford.
+    fn bin_linear(&self, k: usize, clip: f32, keep_max: bool, c: crate::Rect, norm: Option<&Normalized>) -> (Rgb32f, Vec<u8>) {
+        let a = self.active_area;
+        let (bw, bh) = (c.width / k, c.height / k);
+        let scale: [f32; 3] = std::array::from_fn(|s| {
+            let range = self.white_at(s) - self.black.mean();
+            if range > 0.0 { 1.0 / range } else { 1.0 }
+        });
+        let sample = |x: usize, y: usize, s: usize| match norm {
+            Some(n) => n.data.get((y * n.width + x) * 3 + s).copied().unwrap_or(0.0),
+            None => {
+                let v = (self.data.get(((a.y + y) * self.width + a.x + x) * 3 + s) - self.black.at(x, y, s, 3)) * scale[s];
+                if v.is_finite() { v } else { 0.0 }
+            }
+        };
+        let inv = 1.0 / (k * k) as f32;
+        let mut out = Rgb32f::new(bw, bh);
+        let mut mask = vec![0u8; bw * bh];
+        out.data.par_chunks_mut(bw).zip(mask.par_chunks_mut(bw)).enumerate().for_each(|(by, (row, mrow))| {
+            for (bx, (px, m)) in row.iter_mut().zip(mrow.iter_mut()).enumerate() {
+                let (mut sum, mut max) = ([0f32; 3], [f32::MIN; 3]);
+                for dy in 0..k {
+                    for dx in 0..k {
+                        let (x, y) = (c.x + bx * k + dx, c.y + by * k + dy);
+                        for s in 0..3 {
+                            let v = sample(x, y, s);
+                            sum[s] += v;
+                            max[s] = max[s].max(v);
+                        }
+                    }
+                }
+                for ch in 0..3 {
+                    let clipped = max[ch] >= clip;
+                    px[ch] = if clipped && keep_max { max[ch] } else { sum[ch] * inv };
+                    *m |= u8::from(clipped) << ch;
+                }
+            }
+        });
+        (out, mask)
+    }
 }
 
 /// Colours of the `k × k` samples of a block whose corner sits at pattern position `(i, j)`
@@ -168,6 +214,41 @@ mod tests {
             metadata: Metadata::default(),
             lens_metadata: Default::default(),
         }
+    }
+
+    #[test]
+    fn linear_data_bins_to_the_block_means_of_its_development() {
+        // a Lightroom Enhance / Super Resolution DNG: demosaiced already, three samples per pixel
+        let (w, h) = (24, 18);
+        let img = Rgb32f::from_fn(w, h, |x, y| [0.1 + x as f32 * 0.02, 0.2 + y as f32 * 0.03, 0.3 + ((x + y) % 5) as f32 * 0.05]);
+        let mut raw = raw_from(&Normalized { width: w, height: h, cpp: 1, data: vec![0.0; w * h], cfa: None }, 512.0, 16383.0);
+        raw.cpp = 3;
+        raw.cfa = None;
+        raw.data = RawData::U16(img.data.iter().flatten().map(|&v| (v * (16383.0 - 512.0) + 512.0).round() as u16).collect());
+        assert!(raw.can_bin(2) && raw.can_bin(3) && !raw.can_bin(1));
+        raw.crop = Rect::new(3, 0, 18, 18);
+        let full = raw.develop(Method::Bilinear).unwrap();
+        let (b, mask) = raw.develop_binned_masked(3, 0.99).unwrap().unwrap();
+        assert_eq!((b.width, b.height), (6, 6));
+        for (by, bx) in [(0, 0), (2, 5), (5, 3)] {
+            let mut want = [0f32; 3];
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let p = full.get(bx * 3 + dx, by * 3 + dy);
+                    (0..3).for_each(|c| want[c] += p[c] / 9.0);
+                }
+            }
+            let got = b.get(bx, by);
+            assert!((0..3).all(|c| (got[c] - want[c]).abs() < 1e-3), "block ({bx},{by}): {got:?} vs {want:?}");
+        }
+        assert!(mask.iter().all(|&m| m == 0));
+        // one clipped red sample marks its block's red as clipped, and keep_max shows it
+        if let RawData::U16(d) = &mut raw.data {
+            d[(4 * w + 3 + 7) * 3] = 16383;
+        }
+        let (_, mask) = raw.develop_binned_masked(3, 0.99).unwrap().unwrap();
+        assert_eq!(mask[6 + 2], crate::highlight::CLIPPED_R);
+        assert!(raw.develop_binned(3, 0.99).unwrap().unwrap().get(2, 1)[0] >= 0.99);
     }
 
     #[test]
